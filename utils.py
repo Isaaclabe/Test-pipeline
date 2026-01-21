@@ -1,98 +1,86 @@
-"""
-Utility functions for the image processing pipeline.
-"""
-
 import os
 import cv2
-import glob
 import numpy as np
-from typing import List, Optional
-import logging
+import glob
+import shutil
+from typing import List, Tuple, Optional
 
-logger = logging.getLogger("Pipeline")
-
-
-def load_images_from_folder(
-    folder_path: str,
-    mask_h_percent: float = 0.0,
-    mask_w_percent: float = 0.0
-) -> List[np.ndarray]:
-    """
-    Load all images from a folder.
+class ImageUtils:
+    """Utilities for image I/O, directory management, and geometry."""
     
-    Args:
-        folder_path: Path to the folder containing images
-        mask_h_percent: Percentage of height to mask from bottom-right
-        mask_w_percent: Percentage of width to mask from bottom-right
+    @staticmethod
+    def load_images_from_folder(folder_path: str) -> List[np.ndarray]:
+        """Loads all images from a folder."""
+        images = []
+        if not os.path.exists(folder_path):
+            return images
+            
+        exts = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
+        image_files = []
+        for ext in exts:
+            image_files.extend(glob.glob(os.path.join(folder_path, ext)))
         
-    Returns:
-        List of loaded images
-    """
-    if not os.path.exists(folder_path):
-        return []
+        image_files = sorted(list(set(image_files))) 
 
-    extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
-    image_paths = []
-    
-    for ext in extensions:
-        image_paths.extend(glob.glob(os.path.join(folder_path, ext)))
-        image_paths.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+        for f in image_files:
+            img = cv2.imread(f)
+            if img is not None:
+                images.append(img)
+        return images
 
-    image_paths = sorted(set(image_paths))
-    images = []
+    @staticmethod
+    def clear_and_create_dir(path: str):
+        if os.path.exists(path):
+            try:
+                shutil.rmtree(path)
+            except Exception as e:
+                print(f"Warning: Could not clear directory {path}: {e}")
+        os.makedirs(path, exist_ok=True)
 
-    for path in image_paths:
-        img = cv2.imread(path)
-        if img is not None:
-            # Apply corner masking if specified
-            if mask_h_percent > 0 or mask_w_percent > 0:
-                img = apply_corner_mask(img, mask_h_percent, mask_w_percent)
-            images.append(img)
+    @staticmethod
+    def save_crop(image: np.ndarray, mask: np.ndarray, save_path: str):
+        """Saves a crop of the image defined by the mask."""
+        if image is None or mask is None:
+            return
 
-    return images
+        try:
+            mask = mask.astype(np.uint8)
+            if mask.max() > 1:
+                mask = (mask > 0).astype(np.uint8)
+                
+            coords = cv2.findNonZero(mask)
+            if coords is None:
+                return
+                
+            x, y, w, h = cv2.boundingRect(coords)
+            
+            crop_img = image[y:y+h, x:x+w]
+            crop_mask = mask[y:y+h, x:x+w]
+            
+            b, g, r = cv2.split(crop_img)
+            alpha = crop_mask * 255
+            
+            out = cv2.merge([b, g, r, alpha])
+            cv2.imwrite(save_path, out)
+        except Exception as e:
+            print(f"Failed to save crop {save_path}: {e}")
 
-
-def apply_corner_mask(
-    img: np.ndarray,
-    h_percent: float,
-    w_percent: float
-) -> np.ndarray:
-    """
-    Apply a black mask to the bottom-right corner of an image.
-    Useful for hiding watermarks or timestamps.
-    """
-    h, w = img.shape[:2]
-    mask_h = int(h * h_percent)
-    mask_w = int(w * w_percent)
-    
-    result = img.copy()
-    result[h - mask_h:, w - mask_w:] = 0
-    
-    return result
-
-
-def ensure_dir(path: str) -> str:
-    """Create directory if it doesn't exist."""
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def save_image(img: np.ndarray, path: str) -> bool:
-    """Save image to disk."""
-    try:
-        ensure_dir(os.path.dirname(path))
-        cv2.imwrite(path, img)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save image: {e}")
-        return False
-
-
-def resize_for_display(img: np.ndarray, max_dim: int = 800) -> np.ndarray:
-    """Resize image for display purposes."""
-    h, w = img.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        new_w, new_h = int(w * scale), int(h * scale)
-        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return img
+    @staticmethod
+    def calculate_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+        """Calculates Intersection over Union."""
+        if mask1 is None or mask2 is None: return 0.0
+        
+        # Ensure dimensions match
+        if mask1.shape != mask2.shape:
+            mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        # Convert to boolean logic to handle 0/255 or 0/1 masks
+        m1 = mask1 > 0
+        m2 = mask2 > 0
+        
+        intersection = np.logical_and(m1, m2).sum()
+        union = np.logical_or(m1, m2).sum()
+        
+        if union == 0:
+            return 0.0
+        return intersection / union
