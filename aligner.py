@@ -40,6 +40,10 @@ class ImageAligner:
         index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
         search_params = dict(checks=50)
         self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        
+        # ORB (Final fallback)
+        self.orb = cv2.ORB_create(nfeatures=10000)
+        self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # Init Deep Models
         if self.device == 'cuda':
@@ -82,16 +86,18 @@ class ImageAligner:
         else:
             warped, H = self._run_matcher(target_img, source_img, debug_path, offset=(0,0))
 
-        # Sanity Check & Fallback
+        # Cascade Fallback: LoFTR -> SIFT -> ORB
         if not self._is_valid_homography(H):
-            # Fallback to SIFT on full image if Deep Matching/Tiling failed
-            if self.method != "sift":
-                # Ensure we pass the required offset argument here
-                warped, H = self._align_sift(target_img, source_img, debug_path, offset=(0,0))
+            logger.info(f"Primary method ({self.method}) failed, trying SIFT fallback...")
+            warped, H = self._align_sift(target_img, source_img, debug_path, offset=(0,0))
+            
+            if not self._is_valid_homography(H):
+                logger.info("SIFT fallback failed, trying ORB fallback...")
+                warped, H = self._align_orb(target_img, source_img, debug_path, offset=(0,0))
+                
                 if not self._is_valid_homography(H):
+                    logger.warning("All alignment methods failed (LoFTR -> SIFT -> ORB)")
                     return None, None
-            else:
-                return None, None
 
         return warped, H
 
@@ -274,6 +280,42 @@ class ImageAligner:
             # pts_dst correspond to target image
             p_dst = pts_dst.reshape(-1, 2)
             # pts_src correspond to source image
+            p_src = pts_src.reshape(-1, 2)
+            self._plot_matches(target, p_dst, source, p_src, mask, debug_path)
+
+        if H is None: return None, None
+        h, w = target.shape[:2]
+        warped = cv2.warpPerspective(source, H, (w, h))
+        return warped, H
+
+    def _align_orb(self, target, source, debug_path, offset):
+        """ORB-based alignment as final fallback."""
+        g_t = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+        g_s = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+
+        kp1, des1 = self.orb.detectAndCompute(g_t, None)
+        kp2, des2 = self.orb.detectAndCompute(g_s, None)
+
+        if des1 is None or des2 is None: return None, None
+
+        # Use knnMatch with k=2 for ratio test
+        matches = self.bf_matcher.knnMatch(des1, des2, k=2)
+        
+        # Apply Lowe's ratio test
+        good = []
+        for m_n in matches:
+            if len(m_n) == 2 and m_n[0].distance < 0.75 * m_n[1].distance:
+                good.append(m_n[0])
+
+        if len(good) < 8: return None, None
+
+        pts_dst = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        pts_src = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(pts_src, pts_dst, cv2.USAC_MAGSAC, 5.0)
+
+        if debug_path and H is not None:
+            p_dst = pts_dst.reshape(-1, 2)
             p_src = pts_src.reshape(-1, 2)
             self._plot_matches(target, p_dst, source, p_src, mask, debug_path)
 
