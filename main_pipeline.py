@@ -25,6 +25,16 @@ Output Naming:
     - Stitched face: store{i}_year{j}_face{k}_s.jpg
     - Normal face: store{i}_year{j}_face{k}_n.jpg  
     - Warped signface: store{i}_year{j}_signface{k}_w_{l}.jpg
+
+Usage in Colab:
+    from main_pipeline import run_pipeline
+    
+    run_pipeline(
+        input_dir="./data-image",
+        output_dir="./store_process",
+        debug=True,
+        method="auto"  # or "loftr", "lightglue_disk", "sift", etc.
+    )
 """
 
 import os
@@ -51,6 +61,20 @@ DEFAULT_OUTPUT_DIR = "./store_process"
 # Corner masking (to hide watermarks/timestamps)
 MASK_H_PERCENT = 0.05  # 5% from bottom
 MASK_W_PERCENT = 0.15  # 15% from right
+
+# Available alignment methods
+ALIGNMENT_METHODS = [
+    "auto",              # Try all methods in cascade
+    "loftr",             # LoFTR only
+    "lightglue_disk",    # LightGlue + DISK only
+    "lightglue_sp",      # LightGlue + SuperPoint only
+    "keynet_hardnet",    # KeyNet + HardNet only
+    "sift",              # SIFT only
+    "sift_multiscale",   # SIFT with multiple scales
+    "akaze",             # AKAZE only
+    "orb",               # ORB only
+    "template",          # Template matching only
+]
 
 
 # =============================================================================
@@ -110,18 +134,25 @@ class StorePipeline:
         root_dir: str,
         output_dir: str,
         debug: bool = False,
+        method: str = "auto",
         mask_h: float = MASK_H_PERCENT,
         mask_w: float = MASK_W_PERCENT
     ):
         self.root_dir = root_dir
         self.output_dir = output_dir
         self.debug = debug
+        self.method = method.lower()
         self.mask_h = mask_h
         self.mask_w = mask_w
         
+        # Validate method
+        if self.method not in ALIGNMENT_METHODS:
+            logger.warning(f"Unknown method '{method}'. Using 'auto'.")
+            self.method = "auto"
+        
         # Initialize components
         self.stitcher = ImageStitcher(debug=debug)
-        self.aligner = ImageAligner(debug=debug)
+        self.aligner = ImageAligner(debug=debug, method=self.method)
         
         # Create output directory
         ensure_dir(output_dir)
@@ -134,6 +165,7 @@ class StorePipeline:
         logger.info(f"Root Directory: {self.root_dir}")
         logger.info(f"Output Directory: {self.output_dir}")
         logger.info(f"Debug Mode: {self.debug}")
+        logger.info(f"Alignment Method: {self.method}")
         logger.info(f"Corner Mask: H={self.mask_h*100:.1f}%, W={self.mask_w*100:.1f}%")
         logger.info("=" * 60)
 
@@ -388,6 +420,57 @@ class StorePipeline:
 # ENTRY POINT
 # =============================================================================
 
+def run_pipeline(
+    input_dir: str = DEFAULT_ROOT_DIR,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    debug: bool = False,
+    method: str = "auto",
+    mask_h: float = MASK_H_PERCENT,
+    mask_w: float = MASK_W_PERCENT
+):
+    """
+    Run the image processing pipeline.
+    
+    This function is designed for inline use in Jupyter/Colab notebooks.
+    
+    Args:
+        input_dir: Path to input data directory (default: ./data-image)
+        output_dir: Path to output directory (default: ./store_process)
+        debug: Enable debug mode with visualizations (default: False)
+        method: Alignment method to use. Options:
+            - "auto": Try all methods in cascade (default)
+            - "loftr": LoFTR transformer-based matching
+            - "lightglue_disk": LightGlue + DISK features
+            - "lightglue_sp": LightGlue + SuperPoint features
+            - "keynet_hardnet": KeyNet + HardNet
+            - "sift": Standard SIFT
+            - "sift_multiscale": SIFT with multiple scales
+            - "akaze": AKAZE features
+            - "orb": ORB features
+            - "template": Template matching
+        mask_h: Height mask percentage for bottom corner (default: 0.05)
+        mask_w: Width mask percentage for right corner (default: 0.15)
+    
+    Example:
+        >>> from main_pipeline import run_pipeline
+        >>> run_pipeline(
+        ...     input_dir="./data-image-2",
+        ...     output_dir="./store_process",
+        ...     debug=True,
+        ...     method="auto"
+        ... )
+    """
+    pipeline = StorePipeline(
+        root_dir=input_dir,
+        output_dir=output_dir,
+        debug=debug,
+        method=method,
+        mask_h=mask_h,
+        mask_w=mask_w
+    )
+    pipeline.run()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Store Image Processing Pipeline",
@@ -411,6 +494,12 @@ def main():
         help="Enable debug mode (saves visualizations)"
     )
     parser.add_argument(
+        "-m", "--method",
+        default="auto",
+        choices=ALIGNMENT_METHODS,
+        help=f"Alignment method (default: auto). Options: {', '.join(ALIGNMENT_METHODS)}"
+    )
+    parser.add_argument(
         "--mask-h",
         type=float,
         default=MASK_H_PERCENT,
@@ -425,16 +514,33 @@ def main():
     
     args = parser.parse_args()
     
-    pipeline = StorePipeline(
-        root_dir=args.input,
+    run_pipeline(
+        input_dir=args.input,
         output_dir=args.output,
         debug=args.debug,
+        method=args.method,
         mask_h=args.mask_h,
         mask_w=args.mask_w
     )
-    
-    pipeline.run()
 
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# COLAB / NOTEBOOK INLINE CONFIGURATION
+# =============================================================================
+# Uncomment and modify the following lines to run directly in a notebook:
+
+# INPUT_DIR = "/content/data-image-2"
+# OUTPUT_DIR = "/content/store_process"
+# DEBUG = True
+# METHOD = "auto"  # Options: auto, loftr, lightglue_disk, lightglue_sp, sift, etc.
+
+# run_pipeline(
+#     input_dir=INPUT_DIR,
+#     output_dir=OUTPUT_DIR,
+#     debug=DEBUG,
+#     method=METHOD
+# )
