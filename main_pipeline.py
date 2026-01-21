@@ -43,8 +43,21 @@ import logging
 import argparse
 import cv2
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from typing import List, Optional, Tuple
+
+# Enable inline plotting for Jupyter/Colab
+try:
+    from IPython import get_ipython
+    if get_ipython() is not None:
+        get_ipython().run_line_magic('matplotlib', 'inline')
+except:
+    pass
+
+# Use non-interactive backend if not in notebook
+if 'inline' not in matplotlib.get_backend():
+    matplotlib.use('Agg')
 
 from utils import load_images_from_folder, ensure_dir, save_image
 from stitcher import ImageStitcher
@@ -55,8 +68,8 @@ from aligner import ImageAligner
 # CONFIGURATION
 # =============================================================================
 
-DEFAULT_ROOT_DIR = "./data-image"
-DEFAULT_OUTPUT_DIR = "./store_process"
+DEFAULT_ROOT_DIR = "/content/Test-pipeline/data-image-2"
+DEFAULT_OUTPUT_DIR = "/content/Test-pipeline/store_process"
 
 # Corner masking (to hide watermarks/timestamps)
 MASK_H_PERCENT = 0.05  # 5% from bottom
@@ -411,6 +424,7 @@ class StorePipeline:
             
             plt.tight_layout()
             plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.show()  # Display inline in notebooks
             plt.close(fig)
         except Exception as e:
             logger.debug(f"Failed to save comparison plot: {e}")
