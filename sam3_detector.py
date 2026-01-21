@@ -14,10 +14,9 @@ try:
     import sam3
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
-    HAS_SAM3 = True
 except ImportError:
-    print("WARNING: SAM3 not found. Please install via: pip install 'git+https://github.com/facebookresearch/sam3.git'")
-    HAS_SAM3 = False
+    print("CRITICAL ERROR: SAM3 not found. Please install via: pip install 'git+https://github.com/facebookresearch/sam3.git'")
+    raise
 
 
 class SAM3SignDetector:
@@ -53,25 +52,28 @@ class SAM3SignDetector:
             raise RuntimeError("Could not acquire BPE file needed for SAM3 text prompts.")
 
     def _initialize_model(self):
-        """Initializes the SAM3 model."""
-        if not HAS_SAM3:
-            print("SAM3 not available. Detector will not function.")
-            return
-            
+        """Initializes the SAM3 model. Protected by lock during inference, but init happens once."""
         print(f"Initializing SAM3 on {self.device}...")
         
         # 1. AUTHENTICATION
         try:
+            print(f"Attempting HuggingFace Login...")
             login(token=self.hf_token)
         except Exception as e:
-            print("Auth warning: Check HF_TOKEN if model fails to load.")
+            print("----------------------------------------------------------------")
+            print("CRITICAL AUTH ERROR: HuggingFace Login failed.")
+            print(f"Error details: {e}")
+            print("Please ensure your HF_TOKEN is valid and you have accepted the license")
+            print("for 'facebook/sam3' at https://huggingface.co/facebook/sam3")
+            print("----------------------------------------------------------------")
+            raise
 
         # 2. LOCATE/DOWNLOAD BPE ASSETS
         sam3_root = os.path.dirname(sam3.__file__)
         possible_paths = [
-            os.path.join(sam3_root, "..", "assets", "bpe_simple_vocab_16e6.txt.gz"),
-            os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz"),
-            os.path.join(os.getcwd(), "assets", "bpe_simple_vocab_16e6.txt.gz")
+            os.path.join(sam3_root, "..", "assets", "bpe_simple_vocab_16e6.txt.gz"),  # Git clone style
+            os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz"),        # Pkg style
+            os.path.join(os.getcwd(), "assets", "bpe_simple_vocab_16e6.txt.gz")       # Local fallback
         ]
         
         bpe_path = None
@@ -81,43 +83,60 @@ class SAM3SignDetector:
                 break
         
         if bpe_path is None:
-            print("BPE asset not found. Downloading...")
+            print("BPE asset not found in package. Downloading to local ./assets folder...")
             local_asset_path = os.path.join(os.getcwd(), "assets", "bpe_simple_vocab_16e6.txt.gz")
             self._download_bpe_file(local_asset_path)
             bpe_path = local_asset_path
 
+        print(f"Using BPE path: {bpe_path}")
+
         # 3. BUILD MODEL
+        # Optimization settings
         if self.device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
         try:
             self.model = build_sam3_image_model(bpe_path=bpe_path)
-            self.model.to(self.device)
-            self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
-            print("SAM3 Initialization Complete.")
         except Exception as e:
             print(f"Error building SAM3 model: {e}")
             raise
 
+        self.model.to(self.device)
+        self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
+        print("SAM3 Initialization Complete.")
+
     def detect_segmentation(self, image: np.ndarray) -> List[np.ndarray]:
-        """Runs SAM3 inference and returns list of binary masks."""
+        """
+        Runs SAM3 inference on the image.
+        Returns a list of binary masks (numpy arrays of shape (H, W)).
+        """
         if self.model is None:
             return []
 
+        # Convert OpenCV BGR to PIL RGB
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        
+        # Determine dtype
         dtype = torch.bfloat16 if self.device == 'cuda' and torch.cuda.is_bf16_supported() else torch.float32
 
+        # CRITICAL: Use a lock to prevent multiple threads from accessing the GPU model simultaneously
         with SAM3SignDetector._lock:
             with torch.autocast(self.device, dtype=dtype):
                 try:
+                    # 1. Initialize Inference State
                     inference_state = self.processor.set_image(pil_image)
+                    
+                    # 2. Reset Prompts
                     self.processor.reset_all_prompts(inference_state)
+                    
+                    # 3. Apply Text Prompt
                     inference_state = self.processor.set_text_prompt(
                         state=inference_state, 
                         prompt=self.text_prompt
                     )
                     
+                    # 4. Extract Masks
                     masks_tensor = None
                     if hasattr(inference_state, 'pred_masks'):
                         masks_tensor = inference_state.pred_masks
@@ -130,21 +149,27 @@ class SAM3SignDetector:
                     if masks_tensor is None:
                         return []
 
+                    # Process Masks: Tensor -> List of Numpy Arrays
                     output_masks = []
+                    
+                    # Ensure we are on CPU and numpy
                     if isinstance(masks_tensor, torch.Tensor):
                         masks_np = masks_tensor.detach().cpu().numpy()
                     else:
                         masks_np = masks_tensor
 
+                    # Iterate over detected objects
                     for m in masks_np:
+                        # Remove channel dim if present (1, H, W) -> (H, W)
                         if m.ndim == 3 and m.shape[0] == 1:
                             m = m.squeeze(0)
                         
                         if m.dtype != bool and m.max() > 1.0:
-                            binary_mask = (m > 0).astype(np.uint8)
+                            binary_mask = (m > 0).astype(np.uint8)  # Logits
                         else:
                             binary_mask = m.astype(np.uint8)
 
+                        # Resize if mask resolution differs
                         h_orig, w_orig = image.shape[:2]
                         if binary_mask.shape != (h_orig, w_orig):
                             binary_mask = cv2.resize(binary_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
@@ -155,11 +180,16 @@ class SAM3SignDetector:
 
                 except Exception as e:
                     print(f"Error during SAM3 inference: {e}")
+                    import traceback
+                    traceback.print_exc()
                     return []
 
     def is_fragmented(self, mask: np.ndarray) -> bool:
-        """Check if mask has multiple disconnected components."""
+        """
+        Checks if a single segmentation mask is fragmented (more than 1 connected component).
+        """
         num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+        # num_labels includes background (0). So if num_labels > 2, we have >1 foreground object.
         return num_labels > 2
     
     @staticmethod
