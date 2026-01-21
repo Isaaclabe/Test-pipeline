@@ -231,9 +231,27 @@ class Step2Pipeline:
             return 0.0
         return intersection / union
     
-    def masks_overlap(self, mask1: np.ndarray, mask2: np.ndarray, threshold: float = 0.1) -> bool:
-        """Check if two masks have significant overlap."""
-        return self.calculate_overlap(mask1, mask2) > threshold
+    def masks_overlap(self, mask1: np.ndarray, mask2: np.ndarray, threshold: float = 0.05) -> bool:
+        """Check if two masks have significant overlap (intersection over smaller mask area)."""
+        if mask1 is None or mask2 is None:
+            return False
+        
+        # Ensure same dimensions
+        if mask1.shape != mask2.shape:
+            mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        m1 = mask1 > 0
+        m2 = mask2 > 0
+        
+        intersection = np.logical_and(m1, m2).sum()
+        
+        # Use intersection over smaller mask area (more lenient than IoU)
+        smaller_area = min(m1.sum(), m2.sum())
+        if smaller_area == 0:
+            return False
+        
+        overlap_ratio = intersection / smaller_area
+        return overlap_ratio > threshold
     
     def process_data_folder(self, data_process_dir: str, store_name: str, data_name: str, original_store_path: str):
         """Process a single data folder (e.g., data1_process)."""
@@ -254,72 +272,91 @@ class Step2Pipeline:
             # --- 1. Load ORIGINAL full-size face images (no cropping) for SAM3 ---
             # Path to original face folder: original_root/storeX/dataY/faceZ
             original_face_folder = os.path.join(original_store_path, data_name, face_folder_name)
-            face_masks_all = []  # Store all face masks temporarily
+            face_masks_all = []  # Store ALL face masks temporarily
             
             if os.path.exists(original_face_folder):
                 # Load original images WITHOUT cropping (crop_bottom=False)
                 original_face_images = ImageUtils.load_images_from_folder(original_face_folder, crop_bottom=False)
                 logger.info(f"        Loading {len(original_face_images)} original full-size face images from {original_face_folder}")
                 
-                for face_img in original_face_images:
+                for img_idx, face_img in enumerate(original_face_images):
                     if face_img is None:
                         continue
                         
                     masks = self.detector.detect_segmentation(face_img)
-                    logger.info(f"        Face image: found {len(masks)} masks")
+                    logger.info(f"        Face image {img_idx}: found {len(masks)} masks")
                     face_masks_all.extend(masks)
+                    
+                logger.info(f"        Total face masks collected: {len(face_masks_all)}")
             else:
                 logger.warning(f"        Original face folder not found: {original_face_folder}")
             
-            # --- 2. Load and segment signface images (keep only largest) ---
+            # --- 2. Load and segment WARPED signface images (keep only LARGEST mask per image) ---
             signface_largest_masks = []  # Store largest mask from each signface
             
             if os.path.exists(signface_proc_folder):
                 signface_images = glob.glob(os.path.join(signface_proc_folder, "*.jpg"))
+                logger.info(f"        Found {len(signface_images)} warped signface images")
                 
-                for sf_img_path in signface_images:
+                for sf_idx, sf_img_path in enumerate(signface_images):
                     sf_img = cv2.imread(sf_img_path)
                     if sf_img is None:
                         continue
                     
                     masks = self.detector.detect_segmentation(sf_img)
-                    logger.info(f"        Signface image: found {len(masks)} masks")
+                    logger.info(f"        Signface image {sf_idx}: found {len(masks)} masks")
                     
-                    # Keep only the largest mask
+                    # Keep only the LARGEST mask
                     largest_mask = SAM3SignDetector.get_largest_mask(masks)
                     if largest_mask is not None:
                         signface_largest_masks.append(largest_mask)
+                        
+                logger.info(f"        Total signface largest masks: {len(signface_largest_masks)}")
+            else:
+                logger.warning(f"        Signface process folder not found: {signface_proc_folder}")
             
-            # --- 3. Compare and select overlapping masks ---
+            # --- 3. Compare and select masks ---
+            # Logic: For each signface mask, check overlap with face masks
+            # - If overlap found -> keep the FACE mask (it's from full image)
+            # - If NO overlap found -> use the SIGNFACE mask directly
             selected_masks = []
             
-            for sf_mask in signface_largest_masks:
-                has_overlap = False
-                
-                for face_mask in face_masks_all:
-                    if self.masks_overlap(sf_mask, face_mask):
-                        # Found overlap - add the face mask to selected
-                        selected_masks.append(face_mask)
-                        has_overlap = True
-                
-                # If signface mask has no overlap with any face mask, use it directly
-                if not has_overlap:
-                    logger.info(f"        Signface mask has no overlap, using as face mask")
-                    selected_masks.append(sf_mask)
+            if len(signface_largest_masks) == 0:
+                # No signface masks - cannot filter face masks, skip or keep all?
+                logger.warning(f"        No signface masks found. No masks will be saved for {face_folder_name}.")
+            else:
+                for sf_idx, sf_mask in enumerate(signface_largest_masks):
+                    overlapping_face_masks = []
+                    
+                    # Find ALL face masks that overlap with this signface mask
+                    for face_mask in face_masks_all:
+                        if self.masks_overlap(sf_mask, face_mask):
+                            overlapping_face_masks.append(face_mask)
+                    
+                    logger.info(f"        Signface mask {sf_idx}: found {len(overlapping_face_masks)} overlapping face masks")
+                    
+                    if len(overlapping_face_masks) > 0:
+                        # Add all overlapping face masks to selected
+                        selected_masks.extend(overlapping_face_masks)
+                    else:
+                        # No overlap - use signface mask directly as face mask
+                        logger.info(f"        Signface mask {sf_idx} has NO overlap with any face mask -> using it directly")
+                        selected_masks.append(sf_mask)
             
-            # Also check if any face masks weren't matched but should be included
-            # (optional: you might want to keep all face masks that overlap with ANY signface mask)
+            logger.info(f"        Selected masks before dedup: {len(selected_masks)}")
             
             # --- 4. Remove duplicate masks ---
             unique_masks = []
             for mask in selected_masks:
                 is_duplicate = False
                 for existing in unique_masks:
-                    if self.calculate_overlap(mask, existing) > 0.9:  # 90% overlap = duplicate
+                    if self.calculate_overlap(mask, existing) > 0.8:  # 80% IoU = duplicate
                         is_duplicate = True
                         break
                 if not is_duplicate:
                     unique_masks.append(mask)
+            
+            logger.info(f"        Unique masks after dedup: {len(unique_masks)}")
             
             # --- 5. Save selected masks ---
             # Extract year from data_name (e.g., "data1" -> "1")
