@@ -13,8 +13,8 @@ from stitcher import ImageStitcher
 from aligner import ImageAligner
 
 # --- CONFIGURATION ---
-ROOT_DIR = "/content/Project-SmartSign/data-image"
-OUTPUT_DIR = "/content/Project-SmartSign/store_process"
+ROOT_DIR = "/content/Test-pipeline/data-image"
+OUTPUT_DIR = "/content/Test-pipeline/store_process"
 DEBUG_MODE = True
 ALIGNMENT_METHOD = "sift" # Options: "sift", "orb", "loftr" (if GPU)
 # ---------------------
