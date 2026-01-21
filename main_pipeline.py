@@ -195,16 +195,17 @@ class Step2Pipeline:
     """
     Step 2: SAM3 Segmentation and Mask Matching
     
-    - Runs SAM3 on face images (keeps all masks temporarily)
+    - Runs SAM3 on face images (keeps all masks temporarily) - uses ORIGINAL full-size images
     - Runs SAM3 on warped signface images (keeps only largest mask)
     - Compares signface masks with face masks per store/data/face
     - Keeps only overlapping masks
     - If signface mask has no overlap, uses it directly as face mask
     """
     
-    def __init__(self, input_dir: str, output_dir: str, hf_token: str, debug: bool = False):
+    def __init__(self, input_dir: str, output_dir: str, original_root_dir: str, hf_token: str, debug: bool = False):
         self.input_dir = input_dir  # store_process directory from Step 1
         self.output_dir = output_dir  # mask_output directory
+        self.original_root_dir = original_root_dir  # Original data directory for full-size images
         self.debug = debug
         self.detector = SAM3SignDetector(hf_token=hf_token, text_prompt="sign")
         
@@ -234,7 +235,7 @@ class Step2Pipeline:
         """Check if two masks have significant overlap."""
         return self.calculate_overlap(mask1, mask2) > threshold
     
-    def process_data_folder(self, data_process_dir: str, store_name: str, data_name: str):
+    def process_data_folder(self, data_process_dir: str, store_name: str, data_name: str, original_store_path: str):
         """Process a single data folder (e.g., data1_process)."""
         logger.info(f"    Processing {data_name}...")
         
@@ -247,21 +248,28 @@ class Step2Pipeline:
             
             logger.info(f"      Processing {face_folder_name}...")
             
-            # Corresponding signface_process folder
+            # Corresponding signface_process folder (warped images from Step 1)
             signface_proc_folder = os.path.join(data_process_dir, f"signface{face_idx}_process")
             
-            # --- 1. Load and segment face images ---
-            face_images = glob.glob(os.path.join(face_proc_folder, "*.jpg"))
+            # --- 1. Load ORIGINAL full-size face images (no cropping) for SAM3 ---
+            # Path to original face folder: original_root/storeX/dataY/faceZ
+            original_face_folder = os.path.join(original_store_path, data_name, face_folder_name)
             face_masks_all = []  # Store all face masks temporarily
             
-            for face_img_path in face_images:
-                face_img = cv2.imread(face_img_path)
-                if face_img is None:
-                    continue
-                    
-                masks = self.detector.detect_segmentation(face_img)
-                logger.info(f"        Face image: found {len(masks)} masks")
-                face_masks_all.extend(masks)
+            if os.path.exists(original_face_folder):
+                # Load original images WITHOUT cropping (crop_bottom=False)
+                original_face_images = ImageUtils.load_images_from_folder(original_face_folder, crop_bottom=False)
+                logger.info(f"        Loading {len(original_face_images)} original full-size face images from {original_face_folder}")
+                
+                for face_img in original_face_images:
+                    if face_img is None:
+                        continue
+                        
+                    masks = self.detector.detect_segmentation(face_img)
+                    logger.info(f"        Face image: found {len(masks)} masks")
+                    face_masks_all.extend(masks)
+            else:
+                logger.warning(f"        Original face folder not found: {original_face_folder}")
             
             # --- 2. Load and segment signface images (keep only largest) ---
             signface_largest_masks = []  # Store largest mask from each signface
@@ -337,33 +345,34 @@ class Step2Pipeline:
             logger.error(f"Input directory not found: {self.input_dir}")
             return
         
-        # Find all data_process folders in the input directory
-        # Structure: store_process/data1_process, data2_process, etc.
-        data_process_folders = sorted(glob.glob(os.path.join(self.input_dir, "data*_process")))
-        
-        if not data_process_folders:
-            logger.warning("No data_process folders found.")
+        if not os.path.exists(self.original_root_dir):
+            logger.error(f"Original root directory not found: {self.original_root_dir}")
             return
         
-        # We need to determine store name from the processed images
-        # For now, we'll process each data folder and extract store info from filenames
-        for data_proc_folder in data_process_folders:
-            data_name = os.path.basename(data_proc_folder).replace("_process", "")
+        # Find all store folders in original root directory
+        store_paths = sorted(glob.glob(os.path.join(self.original_root_dir, "store*")))
+        
+        if not store_paths:
+            logger.warning("No stores found in original root directory.")
+            return
+        
+        for store_path in store_paths:
+            store_name = os.path.basename(store_path)
+            logger.info(f"  Processing {store_name}...")
             
-            # Get store name from image filenames in face folders
-            face_folders = glob.glob(os.path.join(data_proc_folder, "face*_process"))
-            if face_folders:
-                sample_images = glob.glob(os.path.join(face_folders[0], "*.jpg"))
-                if sample_images:
-                    # Extract store name from filename like "store1_data1_face1_s.jpg"
-                    sample_filename = os.path.basename(sample_images[0])
-                    store_name = sample_filename.split("_")[0]
+            # Find data folders in this store
+            data_paths = sorted(glob.glob(os.path.join(store_path, "data*")))
+            
+            for data_path in data_paths:
+                data_name = os.path.basename(data_path)
+                
+                # Corresponding processed folder from Step 1
+                data_process_dir = os.path.join(self.input_dir, f"{data_name}_process")
+                
+                if os.path.exists(data_process_dir):
+                    self.process_data_folder(data_process_dir, store_name, data_name, store_path)
                 else:
-                    store_name = "store1"  # Default fallback
-            else:
-                store_name = "store1"
-            
-            self.process_data_folder(data_proc_folder, store_name, data_name)
+                    logger.warning(f"    Processed folder not found: {data_process_dir}")
         
         logger.info("Pipeline Step 2 Completed.")
 
@@ -373,6 +382,6 @@ if __name__ == "__main__":
     pipeline1 = Step1Pipeline(ROOT_DIR, OUTPUT_DIR, debug=DEBUG_MODE)
     pipeline1.run()
     
-    # Run Step 2
-    pipeline2 = Step2Pipeline(OUTPUT_DIR, MASK_OUTPUT_DIR, hf_token=HF_TOKEN, debug=DEBUG_MODE)
+    # Run Step 2 (pass original ROOT_DIR for full-size face images)
+    pipeline2 = Step2Pipeline(OUTPUT_DIR, MASK_OUTPUT_DIR, original_root_dir=ROOT_DIR, hf_token=HF_TOKEN, debug=DEBUG_MODE)
     pipeline2.run()
