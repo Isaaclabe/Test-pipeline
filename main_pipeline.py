@@ -6,17 +6,21 @@ import shutil
 import numpy as np
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple, Optional
 
 # Local imports
 from utils import ImageUtils
 from stitcher import ImageStitcher
 from aligner import ImageAligner
+from sam3_detector import SAM3SignDetector
 
 # --- CONFIGURATION ---
 ROOT_DIR = "/content/Test-pipeline/data-image"
 OUTPUT_DIR = "/content/Test-pipeline/store_process"
+MASK_OUTPUT_DIR = "/content/Test-pipeline/mask_output"
 DEBUG_MODE = True
-ALIGNMENT_METHOD = "sift" # Options: "sift", "orb", "loftr" (if GPU)
+ALIGNMENT_METHOD = "sift"  # Options: "sift", "orb", "loftr" (if GPU)
+HF_TOKEN = ""  # Set your HuggingFace token here for SAM3
 # ---------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -186,6 +190,189 @@ class Step1Pipeline:
             
         logger.info("Pipeline Step 1 Completed.")
 
+
+class Step2Pipeline:
+    """
+    Step 2: SAM3 Segmentation and Mask Matching
+    
+    - Runs SAM3 on face images (keeps all masks temporarily)
+    - Runs SAM3 on warped signface images (keeps only largest mask)
+    - Compares signface masks with face masks per store/data/face
+    - Keeps only overlapping masks
+    - If signface mask has no overlap, uses it directly as face mask
+    """
+    
+    def __init__(self, input_dir: str, output_dir: str, hf_token: str, debug: bool = False):
+        self.input_dir = input_dir  # store_process directory from Step 1
+        self.output_dir = output_dir  # mask_output directory
+        self.debug = debug
+        self.detector = SAM3SignDetector(hf_token=hf_token, text_prompt="sign")
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def calculate_overlap(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
+        """Calculate IoU (Intersection over Union) between two masks."""
+        if mask1 is None or mask2 is None:
+            return 0.0
+        
+        # Ensure same dimensions
+        if mask1.shape != mask2.shape:
+            mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        m1 = mask1 > 0
+        m2 = mask2 > 0
+        
+        intersection = np.logical_and(m1, m2).sum()
+        union = np.logical_or(m1, m2).sum()
+        
+        if union == 0:
+            return 0.0
+        return intersection / union
+    
+    def masks_overlap(self, mask1: np.ndarray, mask2: np.ndarray, threshold: float = 0.1) -> bool:
+        """Check if two masks have significant overlap."""
+        return self.calculate_overlap(mask1, mask2) > threshold
+    
+    def process_data_folder(self, data_process_dir: str, store_name: str, data_name: str):
+        """Process a single data folder (e.g., data1_process)."""
+        logger.info(f"    Processing {data_name}...")
+        
+        # Find all face_process folders
+        face_proc_folders = sorted(glob.glob(os.path.join(data_process_dir, "face*_process")))
+        
+        for face_proc_folder in face_proc_folders:
+            face_folder_name = os.path.basename(face_proc_folder).replace("_process", "")
+            face_idx = face_folder_name.replace("face", "")
+            
+            logger.info(f"      Processing {face_folder_name}...")
+            
+            # Corresponding signface_process folder
+            signface_proc_folder = os.path.join(data_process_dir, f"signface{face_idx}_process")
+            
+            # --- 1. Load and segment face images ---
+            face_images = glob.glob(os.path.join(face_proc_folder, "*.jpg"))
+            face_masks_all = []  # Store all face masks temporarily
+            
+            for face_img_path in face_images:
+                face_img = cv2.imread(face_img_path)
+                if face_img is None:
+                    continue
+                    
+                masks = self.detector.detect_segmentation(face_img)
+                logger.info(f"        Face image: found {len(masks)} masks")
+                face_masks_all.extend(masks)
+            
+            # --- 2. Load and segment signface images (keep only largest) ---
+            signface_largest_masks = []  # Store largest mask from each signface
+            
+            if os.path.exists(signface_proc_folder):
+                signface_images = glob.glob(os.path.join(signface_proc_folder, "*.jpg"))
+                
+                for sf_img_path in signface_images:
+                    sf_img = cv2.imread(sf_img_path)
+                    if sf_img is None:
+                        continue
+                    
+                    masks = self.detector.detect_segmentation(sf_img)
+                    logger.info(f"        Signface image: found {len(masks)} masks")
+                    
+                    # Keep only the largest mask
+                    largest_mask = SAM3SignDetector.get_largest_mask(masks)
+                    if largest_mask is not None:
+                        signface_largest_masks.append(largest_mask)
+            
+            # --- 3. Compare and select overlapping masks ---
+            selected_masks = []
+            
+            for sf_mask in signface_largest_masks:
+                has_overlap = False
+                
+                for face_mask in face_masks_all:
+                    if self.masks_overlap(sf_mask, face_mask):
+                        # Found overlap - add the face mask to selected
+                        selected_masks.append(face_mask)
+                        has_overlap = True
+                
+                # If signface mask has no overlap with any face mask, use it directly
+                if not has_overlap:
+                    logger.info(f"        Signface mask has no overlap, using as face mask")
+                    selected_masks.append(sf_mask)
+            
+            # Also check if any face masks weren't matched but should be included
+            # (optional: you might want to keep all face masks that overlap with ANY signface mask)
+            
+            # --- 4. Remove duplicate masks ---
+            unique_masks = []
+            for mask in selected_masks:
+                is_duplicate = False
+                for existing in unique_masks:
+                    if self.calculate_overlap(mask, existing) > 0.9:  # 90% overlap = duplicate
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_masks.append(mask)
+            
+            # --- 5. Save selected masks ---
+            # Extract year from data_name (e.g., "data1" -> "1")
+            year_idx = data_name.replace("data", "")
+            store_idx = store_name.replace("store", "")
+            
+            for mask_id, mask in enumerate(unique_masks):
+                # Naming: store<i>_year<j>_face<k>_mask_<l>.png
+                mask_filename = f"store{store_idx}_year{year_idx}_face{face_idx}_mask_{mask_id}.png"
+                mask_save_path = os.path.join(self.output_dir, mask_filename)
+                
+                # Convert mask to 0-255 for saving
+                mask_to_save = (mask * 255).astype(np.uint8)
+                cv2.imwrite(mask_save_path, mask_to_save)
+                logger.info(f"        Saved: {mask_filename}")
+            
+            logger.info(f"      {face_folder_name}: saved {len(unique_masks)} masks")
+    
+    def run(self):
+        logger.info("Starting Pipeline Step 2 (SAM3 Segmentation)...")
+        
+        if not os.path.exists(self.input_dir):
+            logger.error(f"Input directory not found: {self.input_dir}")
+            return
+        
+        # Find all data_process folders in the input directory
+        # Structure: store_process/data1_process, data2_process, etc.
+        data_process_folders = sorted(glob.glob(os.path.join(self.input_dir, "data*_process")))
+        
+        if not data_process_folders:
+            logger.warning("No data_process folders found.")
+            return
+        
+        # We need to determine store name from the processed images
+        # For now, we'll process each data folder and extract store info from filenames
+        for data_proc_folder in data_process_folders:
+            data_name = os.path.basename(data_proc_folder).replace("_process", "")
+            
+            # Get store name from image filenames in face folders
+            face_folders = glob.glob(os.path.join(data_proc_folder, "face*_process"))
+            if face_folders:
+                sample_images = glob.glob(os.path.join(face_folders[0], "*.jpg"))
+                if sample_images:
+                    # Extract store name from filename like "store1_data1_face1_s.jpg"
+                    sample_filename = os.path.basename(sample_images[0])
+                    store_name = sample_filename.split("_")[0]
+                else:
+                    store_name = "store1"  # Default fallback
+            else:
+                store_name = "store1"
+            
+            self.process_data_folder(data_proc_folder, store_name, data_name)
+        
+        logger.info("Pipeline Step 2 Completed.")
+
+
 if __name__ == "__main__":
-    pipeline = Step1Pipeline(ROOT_DIR, OUTPUT_DIR, debug=DEBUG_MODE)
-    pipeline.run()
+    # Run Step 1
+    pipeline1 = Step1Pipeline(ROOT_DIR, OUTPUT_DIR, debug=DEBUG_MODE)
+    pipeline1.run()
+    
+    # Run Step 2
+    pipeline2 = Step2Pipeline(OUTPUT_DIR, MASK_OUTPUT_DIR, hf_token=HF_TOKEN, debug=DEBUG_MODE)
+    pipeline2.run()
