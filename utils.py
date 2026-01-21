@@ -9,8 +9,31 @@ class ImageUtils:
     """Utilities for image I/O, directory management, and geometry."""
     
     @staticmethod
-    def load_images_from_folder(folder_path: str) -> List[np.ndarray]:
-        """Loads all images from a folder."""
+    def crop_bottom_percent(image: np.ndarray, percent: float = 15.0) -> np.ndarray:
+        """Crops the bottom percentage of an image.
+        
+        Args:
+            image: Input image as numpy array
+            percent: Percentage of the bottom to crop (default 15%)
+            
+        Returns:
+            Cropped image with bottom portion removed
+        """
+        if image is None:
+            return None
+        height = image.shape[0]
+        crop_height = int(height * (1 - percent / 100.0))
+        return image[:crop_height, :]
+    
+    @staticmethod
+    def load_images_from_folder(folder_path: str, crop_bottom: bool = True, crop_percent: float = 15.0) -> List[np.ndarray]:
+        """Loads all images from a folder.
+        
+        Args:
+            folder_path: Path to the folder containing images
+            crop_bottom: Whether to crop the bottom of images (default True)
+            crop_percent: Percentage of bottom to crop (default 15%)
+        """
         images = []
         if not os.path.exists(folder_path):
             return images
@@ -25,6 +48,8 @@ class ImageUtils:
         for f in image_files:
             img = cv2.imread(f)
             if img is not None:
+                if crop_bottom:
+                    img = ImageUtils.crop_bottom_percent(img, crop_percent)
                 images.append(img)
         return images
 
